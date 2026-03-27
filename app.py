@@ -403,6 +403,37 @@ async def on_message(message: discord.Message):
                     inline=False
                 )
 
+                # Add attachments/images to the embed
+                if message.attachments:
+                    # Check for image attachments to display inline
+                    image_attachments = [
+                        att for att in message.attachments
+                        if att.content_type and att.content_type.startswith("image/")
+                    ]
+                    if image_attachments:
+                        # Set first image as embed image
+                        embed.set_image(url=image_attachments[0].url)
+
+                    # List all attachments (with URLs) in a field
+                    attachment_lines = []
+                    for att in message.attachments:
+                        if att.content_type:
+                            attachment_lines.append(f"[{att.filename}]({att.url}) ({att.content_type})")
+                        else:
+                            attachment_lines.append(f"[{att.filename}]({att.url})")
+
+                    if attachment_lines:
+                        # Truncate to avoid Discord's 1024 char limit for field values
+                        attachment_text = "\n".join(attachment_lines)
+                        if len(attachment_text) > 1020:
+                            attachment_text = attachment_text[:1020] + "..."
+
+                        embed.add_field(
+                            name=f"Attachments ({len(attachment_lines)})",
+                            value=attachment_text,
+                            inline=False
+                        )
+
                 # Add user avatar as thumbnail
                 embed.set_thumbnail(url=message.author.display_avatar.url)
 
