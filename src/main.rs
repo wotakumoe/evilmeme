@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     path::PathBuf,
     sync::Arc,
@@ -11,8 +11,24 @@ use dotenvy::dotenv;
 use log::{error, info, warn};
 use serenity::{
     async_trait,
-    builder::{CreateEmbed, CreateMessage, GetMessages},
+    builder::{
+        CreateCommand,
+        CreateCommandOption,
+        CreateEmbed,
+        CreateInteractionResponse,
+        CreateInteractionResponseMessage,
+        CreateMessage,
+        GetMessages,
+    },
     model::{
+        application::{
+            Command,
+            CommandDataOption,
+            CommandDataOptionValue,
+            CommandInteraction,
+            CommandOptionType,
+            Interaction,
+        },
         channel::{Attachment, ChannelType, GuildChannel, Message},
         colour::Colour,
         gateway::Ready,
@@ -41,7 +57,7 @@ struct Config {
 }
 
 struct SharedState {
-    whitelist_role_ids: RwLock<HashSet<RoleId>>,
+    whitelist_role_ids: RwLock<HashMap<GuildId, HashSet<RoleId>>>,
     processing_users: Mutex<HashSet<UserId>>,
     channel_semaphore: Arc<Semaphore>,
 }
@@ -53,17 +69,24 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
-        info!("Bot ready: {} (ID: {})", ready.user.name, ready.user.id);
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        info!(
+            "Logged in as {} (ID: {}).",
+            ready.user.name,
+            ready.user.id
+        );
+        info!("Connected to {} guild(s).", ready.guilds.len());
+        info!("Syncing slash commands...");
+        if let Err(err) = self.register_commands(&ctx).await {
+            warn!("Failed to register slash commands: {err}");
+        } else {
+            info!("Slash commands synced.");
+        }
     }
 
     async fn message(&self, ctx: Context, message: Message) {
         if message.author.bot {
             return;
-        }
-
-        if let Err(err) = self.process_commands(&ctx, &message).await {
-            warn!("Command processing error: {err}");
         }
 
         let guild_id = match message.guild_id {
@@ -132,184 +155,240 @@ impl EventHandler for Handler {
 
         info!("Moderation flow finished for user {}", author_id);
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(command) = interaction else {
+            return;
+        };
+
+        if command.data.name != "whitelist" {
+            return;
+        }
+
+        if let Err(err) = self.handle_whitelist_command(&ctx, &command).await {
+            warn!("Slash command handling error: {err}");
+        }
+    }
 }
 
 impl Handler {
-    async fn process_commands(&self, ctx: &Context, message: &Message) -> anyhow::Result<()> {
-        if !message.content.starts_with("!whitelist") {
-            return Ok(());
-        }
+    async fn register_commands(&self, ctx: &Context) -> anyhow::Result<()> {
+        let role_id_option = CreateCommandOption::new(
+            CommandOptionType::Role,
+            "role",
+            "Role to add or remove",
+        )
+        .required(true);
 
-        let guild_id = match message.guild_id {
-            Some(id) => id,
-            None => return Ok(()),
-        };
+        let command = CreateCommand::new("whitelist")
+            .description("Manage the role whitelist")
+            .default_member_permissions(Permissions::MANAGE_GUILD)
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "add",
+                    "Add a role ID to the whitelist",
+                )
+                .add_sub_option(role_id_option.clone()),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "remove",
+                    "Remove a role ID from the whitelist",
+                )
+                .add_sub_option(role_id_option),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "list",
+                "List whitelisted role IDs",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "reload",
+                "Reload whitelist from disk",
+            ));
 
-        if !self
-            .has_moderator_permissions(ctx, guild_id, message.channel_id, message.author.id)
-            .await?
-        {
-            message
-                .channel_id
-                .send_message(ctx, CreateMessage::new().content("You do not have permission to manage the whitelist."))
-                .await?;
-            return Ok(());
-        }
-
-        let mut parts = message.content.split_whitespace();
-        parts.next();
-        let subcommand = parts.next().unwrap_or("list");
-
-        match subcommand {
-            "add" => {
-                let role_id = parts
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(RoleId::new);
-                if let Some(role_id) = role_id {
-                    self.whitelist_add(ctx, message, role_id).await?;
-                } else {
-                    self.send_usage(ctx, message).await?;
-                }
-            }
-            "remove" => {
-                let role_id = parts
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(RoleId::new);
-                if let Some(role_id) = role_id {
-                    self.whitelist_remove(ctx, message, role_id).await?;
-                } else {
-                    self.send_usage(ctx, message).await?;
-                }
-            }
-            "list" => {
-                self.whitelist_list(ctx, message).await?;
-            }
-            "reload" => {
-                self.whitelist_reload(ctx, message).await?;
-            }
-            _ => {
-                self.send_usage(ctx, message).await?;
-            }
-        }
-
+        Command::set_global_commands(&ctx.http, vec![command]).await?;
         Ok(())
     }
 
-    async fn send_usage(&self, ctx: &Context, message: &Message) -> anyhow::Result<()> {
-        message
-            .channel_id
-            .send_message(
+    async fn handle_whitelist_command(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+    ) -> anyhow::Result<()> {
+        let guild_id = match command.guild_id {
+            Some(id) => id,
+            None => {
+                self.respond_ephemeral(
+                    ctx,
+                    command,
+                    "This command can only be used inside a server.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if !self
+            .has_moderator_permissions(ctx, guild_id, command.channel_id, command.user.id)
+            .await?
+        {
+            self.respond_ephemeral(
                 ctx,
-                CreateMessage::new().content(
-                    "Usage: `!whitelist add <role_id>`, `!whitelist remove <role_id>`, `!whitelist list`, `!whitelist reload`",
+                command,
+                "You do not have permission to manage the whitelist.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let subcommand = match command.data.options.first() {
+            Some(option) => option,
+            None => {
+                self.respond_ephemeral(ctx, command, "Missing subcommand.").await?;
+                return Ok(());
+            }
+        };
+
+        let result = match subcommand.name.as_str() {
+            "add" => {
+                let role_id = match Self::role_id_from_subcommand(subcommand) {
+                    Some(role_id) => role_id,
+                    None => {
+                        self.respond_ephemeral(ctx, command, "Role is required.")
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                self.whitelist_add_role(ctx, guild_id, role_id).await
+            }
+            "remove" => {
+                let role_id = match Self::role_id_from_subcommand(subcommand) {
+                    Some(role_id) => role_id,
+                    None => {
+                        self.respond_ephemeral(ctx, command, "Role is required.")
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                self.whitelist_remove_role(guild_id, role_id).await
+            }
+            "list" => self.whitelist_list_text(ctx, guild_id).await,
+            "reload" => self.whitelist_reload_text(guild_id).await,
+            _ => Ok("Unknown subcommand.".to_string()),
+        };
+
+        let response = match result {
+            Ok(text) => text,
+            Err(err) => {
+                warn!("Whitelist command failed: {err}");
+                "An error occurred while processing the command.".to_string()
+            }
+        };
+
+        self.respond_ephemeral(ctx, command, response).await?;
+        Ok(())
+    }
+
+    async fn respond_ephemeral(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        content: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        command
+            .create_response(
+                ctx,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(content)
+                        .ephemeral(true),
                 ),
             )
             .await?;
         Ok(())
     }
 
-    async fn whitelist_add(
+    async fn whitelist_add_role(
         &self,
         ctx: &Context,
-        message: &Message,
+        guild_id: GuildId,
         role_id: RoleId,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         let mut whitelist = self.state.whitelist_role_ids.write().await;
-        if whitelist.contains(&role_id) {
-            message
-                .channel_id
-                .send_message(
-                    ctx,
-                    CreateMessage::new().content(format!("Role ID {role_id} is already whitelisted.")),
-                )
-                .await?;
-            return Ok(());
+        let guild_roles = whitelist.entry(guild_id).or_default();
+        if guild_roles.contains(&role_id) {
+            return Ok(format!("Role ID {role_id} is already whitelisted."));
         }
 
-        whitelist.insert(role_id);
+        guild_roles.insert(role_id);
         save_whitelist(&self.config.whitelist_file, &whitelist)?;
 
-        let role_name = message
-            .guild_id
-            .and_then(|guild_id| guild_id.to_guild_cached(ctx))
-            .and_then(|guild| guild.roles.get(&role_id).map(|role| role.name.clone()));
+        let role_name = self
+            .role_name_map(ctx, guild_id)
+            .await
+            .and_then(|roles| roles.get(&role_id).cloned());
 
-        if let Some(role_name) = role_name {
-            message
-                .channel_id
-                .send_message(
-                    ctx,
-                    CreateMessage::new()
-                        .content(format!("Added role `{role_name}` ({role_id}) to whitelist.")),
-                )
-                .await?;
+        let response = if let Some(role_name) = role_name {
+            format!("Added role `{role_name}` ({role_id}) to whitelist.")
         } else {
-            message
-                .channel_id
-                .send_message(
-                    ctx,
-                    CreateMessage::new().content(format!(
-                        "Added role ID `{role_id}` to whitelist (role not found on this guild)."
-                    )),
-                )
-                .await?;
-        }
+            format!(
+                "Added role ID `{role_id}` to whitelist (role not found on this guild)."
+            )
+        };
 
-        Ok(())
+        Ok(response)
     }
 
-    async fn whitelist_remove(
+    async fn whitelist_remove_role(
         &self,
-        ctx: &Context,
-        message: &Message,
+        guild_id: GuildId,
         role_id: RoleId,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         let mut whitelist = self.state.whitelist_role_ids.write().await;
-        if !whitelist.remove(&role_id) {
-            message
-                .channel_id
-                .send_message(
-                    ctx,
-                    CreateMessage::new().content(format!("Role ID {role_id} is not in the whitelist.")),
-                )
-                .await?;
-            return Ok(());
+        let guild_roles = match whitelist.get_mut(&guild_id) {
+            Some(roles) => roles,
+            None => {
+                return Ok(format!("Role ID `{role_id}` is not in the whitelist."));
+            }
+        };
+
+        if !guild_roles.remove(&role_id) {
+            return Ok(format!("Role ID `{role_id}` is not in the whitelist."));
+        }
+
+        if guild_roles.is_empty() {
+            whitelist.remove(&guild_id);
         }
 
         save_whitelist(&self.config.whitelist_file, &whitelist)?;
-        message
-            .channel_id
-            .send_message(
-                ctx,
-                CreateMessage::new().content(format!("Removed role ID `{role_id}` from whitelist.")),
-            )
-            .await?;
-        Ok(())
+        Ok(format!("Removed role ID `{role_id}` from whitelist."))
     }
 
-    async fn whitelist_list(&self, ctx: &Context, message: &Message) -> anyhow::Result<()> {
+    async fn whitelist_list_text(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+    ) -> anyhow::Result<String> {
         let whitelist = self.state.whitelist_role_ids.read().await;
-        if whitelist.is_empty() {
-            message
-                .channel_id
-                .send_message(ctx, CreateMessage::new().content("Whitelist is empty."))
-                .await?;
-            return Ok(());
-        }
+        let role_ids_set = match whitelist.get(&guild_id) {
+            Some(roles) if !roles.is_empty() => roles,
+            _ => return Ok("Whitelist is empty.".to_string()),
+        };
 
-        let mut role_ids: Vec<_> = whitelist.iter().copied().collect();
+        let mut role_ids: Vec<_> = role_ids_set.iter().copied().collect();
         role_ids.sort_by_key(|role_id| role_id.get());
 
+        let role_names = self.role_name_map(ctx, guild_id).await;
         let mut lines = Vec::new();
-        if let Some(guild) = message
-            .guild_id
-            .and_then(|guild_id| guild_id.to_guild_cached(ctx))
-        {
+
+        if let Some(role_names) = role_names {
             for role_id in &role_ids {
-                if let Some(role) = guild.roles.get(role_id) {
-                    lines.push(format!("`{role_id}` — {}", role.name));
+                if let Some(role_name) = role_names.get(role_id) {
+                    lines.push(format!("`{role_id}` — {role_name}"));
                 } else {
                     lines.push(format!("`{role_id}` — (not present in this guild)"));
                 }
@@ -321,31 +400,60 @@ impl Handler {
         }
 
         let body = lines.join("\n");
-        message
-            .channel_id
-            .send_message(
-                ctx,
-                CreateMessage::new().content(format!("Whitelisted role IDs:\n{body}")),
-            )
-            .await?;
-        Ok(())
+        Ok(format!("Whitelisted role IDs:\n{body}"))
     }
 
-    async fn whitelist_reload(&self, ctx: &Context, message: &Message) -> anyhow::Result<()> {
+    async fn whitelist_reload_text(&self, guild_id: GuildId) -> anyhow::Result<String> {
         let new_whitelist = load_whitelist(&self.config.whitelist_file)?;
         let mut whitelist = self.state.whitelist_role_ids.write().await;
         *whitelist = new_whitelist;
-        message
-            .channel_id
-            .send_message(
-                ctx,
-                CreateMessage::new().content(format!(
-                    "Reloaded whitelist from disk: {} role IDs.",
-                    whitelist.len()
-                )),
-            )
-            .await?;
-        Ok(())
+        let count = whitelist
+            .get(&guild_id)
+            .map(|roles| roles.len())
+            .unwrap_or(0);
+        Ok(format!(
+            "Reloaded whitelist from disk: {} role IDs for this guild.",
+            count
+        ))
+    }
+
+    async fn role_name_map(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+    ) -> Option<HashMap<RoleId, String>> {
+        if let Some(guild) = guild_id.to_guild_cached(ctx) {
+            return Some(
+                guild
+                    .roles
+                    .iter()
+                    .map(|(id, role)| (*id, role.name.clone()))
+                    .collect(),
+            );
+        }
+
+        match guild_id.to_partial_guild(ctx).await {
+            Ok(guild) => Some(
+                guild
+                    .roles
+                    .into_iter()
+                    .map(|(id, role)| (id, role.name))
+                    .collect(),
+            ),
+            Err(_) => None,
+        }
+    }
+
+    fn role_id_from_subcommand(option: &CommandDataOption) -> Option<RoleId> {
+        let options = match &option.value {
+            CommandDataOptionValue::SubCommand(options) => options,
+            _ => return None,
+        };
+
+        options.iter().find_map(|opt| match (&*opt.name, &opt.value) {
+            ("role", CommandDataOptionValue::Role(role_id)) => Some(*role_id),
+            _ => None,
+        })
     }
 
     async fn has_moderator_permissions(
@@ -391,10 +499,11 @@ impl Handler {
             Err(_) => return Ok(false),
         };
         let whitelist = self.state.whitelist_role_ids.read().await;
-        Ok(member
-            .roles
-            .iter()
-            .any(|role_id| whitelist.contains(role_id)))
+        let guild_roles = match whitelist.get(&guild_id) {
+            Some(roles) => roles,
+            None => return Ok(false),
+        };
+        Ok(member.roles.iter().any(|role_id| guild_roles.contains(role_id)))
     }
 
     async fn ban_user(&self, ctx: &Context, guild_id: GuildId, user_id: UserId) {
@@ -750,21 +859,67 @@ fn whitelist_path(raw_path: &str) -> PathBuf {
     }
 }
 
-fn load_whitelist(path: &PathBuf) -> anyhow::Result<HashSet<RoleId>> {
+fn load_whitelist(path: &PathBuf) -> anyhow::Result<HashMap<GuildId, HashSet<RoleId>>> {
     if !path.exists() {
         info!("Whitelist file {} not present; starting with empty whitelist.", path.display());
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
 
     let data = std::fs::read_to_string(path)?;
-    let list: Vec<u64> = serde_json::from_str(&data).unwrap_or_default();
-    Ok(list.into_iter().map(RoleId::new).collect())
+    let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+    let mut result: HashMap<GuildId, HashSet<RoleId>> = HashMap::new();
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (guild_id, roles_value) in map {
+                let guild_id = match guild_id.parse::<u64>() {
+                    Ok(id) => GuildId::new(id),
+                    Err(_) => continue,
+                };
+
+                let roles = match roles_value {
+                    serde_json::Value::Array(values) => values,
+                    _ => continue,
+                };
+
+                let role_ids: HashSet<RoleId> = roles
+                    .into_iter()
+                    .filter_map(|value| value.as_u64())
+                    .map(RoleId::new)
+                    .collect();
+
+                if !role_ids.is_empty() {
+                    result.insert(guild_id, role_ids);
+                }
+            }
+        }
+        serde_json::Value::Array(_) => {
+            warn!(
+                "Whitelist file {} uses a legacy format. Please rebuild whitelist per guild.",
+                path.display()
+            );
+        }
+        _ => {}
+    }
+
+    Ok(result)
 }
 
-fn save_whitelist(path: &PathBuf, role_ids: &HashSet<RoleId>) -> anyhow::Result<()> {
-    let mut list: Vec<u64> = role_ids.iter().map(|id| id.get()).collect();
-    list.sort_unstable();
-    let json = serde_json::to_string_pretty(&list)?;
+fn save_whitelist(
+    path: &PathBuf,
+    role_ids: &HashMap<GuildId, HashSet<RoleId>>,
+) -> anyhow::Result<()> {
+    let mut payload: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+
+    for (guild_id, roles) in role_ids {
+        let mut list: Vec<u64> = roles.iter().map(|id| id.get()).collect();
+        list.sort_unstable();
+        if !list.is_empty() {
+            payload.insert(guild_id.get().to_string(), list);
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&payload)?;
     let tmp_path = path.with_extension("tmp");
     std::fs::write(&tmp_path, json)?;
     std::fs::rename(tmp_path, path)?;
@@ -831,7 +986,8 @@ fn build_config() -> anyhow::Result<Config> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("evilmeme=info"))
+        .init();
 
     let config = Arc::new(build_config()?);
     let whitelist = load_whitelist(&config.whitelist_file)?;
@@ -856,7 +1012,7 @@ async fn main() -> anyhow::Result<()> {
         .event_handler(handler)
         .await?;
 
-    info!("Starting scammer_bye_bye bot");
+    info!("Starting evil_meme");
     if let Err(err) = client.start().await {
         error!("Bot terminated with error: {err}");
     }
