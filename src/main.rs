@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     builder::{
-        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
+        CreateAttachment, CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMessage,
         GetMessages,
     },
@@ -874,9 +874,37 @@ impl Handler {
         };
         embed = embed.field("Message", content, false);
 
+        let can_attach_files = permissions.attach_files();
+        let mut files = Vec::new();
         if let Some((image_url, attachment_lines)) = build_attachment_info(&message.attachments) {
-            if let Some(image_url) = image_url {
-                embed = embed.image(image_url);
+            if let Some(image_attachment) = first_image_attachment(&message.attachments) {
+                if can_attach_files {
+                    match build_mod_log_attachment(image_attachment).await {
+                        Ok(Some((file, filename))) => {
+                            embed = embed.attachment(filename);
+                            files.push(file);
+                        }
+                        Ok(None) => {
+                            if let Some(image_url) = image_url {
+                                embed = embed.image(image_url);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to re-upload attachment {} for mod log: {err}",
+                                image_attachment.id
+                            );
+                            if let Some(image_url) = image_url {
+                                embed = embed.image(image_url);
+                            }
+                        }
+                    }
+                } else if let Some(image_url) = image_url {
+                    warn!(
+                        "Missing Attach Files permission in mod log channel; using original attachment URL."
+                    );
+                    embed = embed.image(image_url);
+                }
             }
             if !attachment_lines.is_empty() {
                 let mut attachment_text = attachment_lines.join("\n");
@@ -899,7 +927,7 @@ impl Handler {
             message.author.id
         )));
 
-        let msg = CreateMessage::new().add_embed(embed);
+        let msg = CreateMessage::new().add_embed(embed).add_files(files);
         mod_channel_id.send_message(ctx, msg).await?;
         Ok(())
     }
@@ -1115,6 +1143,43 @@ fn build_attachment_info(attachments: &[Attachment]) -> Option<(Option<String>, 
     }
 
     Some((image_url, lines))
+}
+
+fn first_image_attachment(attachments: &[Attachment]) -> Option<&Attachment> {
+    attachments.iter().find(|attachment| {
+        attachment
+            .content_type
+            .as_deref()
+            .is_some_and(|content_type| content_type.starts_with("image/"))
+            || attachment.dimensions().is_some()
+    })
+}
+
+async fn build_mod_log_attachment(
+    attachment: &Attachment,
+) -> anyhow::Result<Option<(CreateAttachment, String)>> {
+    if attachment.size == 0 {
+        return Ok(None);
+    }
+
+    let filename = mod_log_attachment_filename(&attachment.filename);
+    let data = attachment.download().await?;
+    Ok(Some((
+        CreateAttachment::bytes(data, filename.clone()),
+        filename,
+    )))
+}
+
+fn mod_log_attachment_filename(filename: &str) -> String {
+    let filename = filename
+        .trim_start_matches("SPOILER_")
+        .replace(['/', '\\'], "_");
+
+    if filename.is_empty() {
+        "honeypot-image.png".to_string()
+    } else {
+        filename
+    }
 }
 
 fn build_warning_embed() -> CreateEmbed {
