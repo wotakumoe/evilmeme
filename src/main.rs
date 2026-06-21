@@ -1063,8 +1063,7 @@ fn build_warning_embed() -> CreateEmbed {
         .description(
             "If you post something here, you WILL BE BANNED INSTANTLY.\n\n\
 This channel is a honeypot for compromised accounts and spam bots.\n\
-⚠️ This is your only warning.\n\
-Turn back now.\n\
+⚠️ This is your only warning. Turn back now.\n\
 This message is permanent. The channel is actively monitored.",
         )
         .color(Colour::DARK_RED)
