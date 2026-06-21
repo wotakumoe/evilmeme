@@ -1061,11 +1061,13 @@ fn build_warning_embed() -> CreateEmbed {
     CreateEmbed::new()
         .title("🚨 DO NOT POST HERE 🚨")
         .description(
-            "If you post something here, you WILL BE BANNED INSTANTLY.\n\n\
+            "If you post something here, you **WILL BE BANNED INSTANTLY**.\n\n\
 This channel is a honeypot for compromised accounts and spam bots.\n\
-⚠️ This is your only warning. Turn back now.\n\
-This message is permanent. The channel is actively monitored.",
+⚠️ This is your only warning.",
         )
+        .footer(CreateEmbedFooter::new(
+            "This message is permanent. The channel is actively monitored.",
+        ))
         .color(Colour::DARK_RED)
 }
 
