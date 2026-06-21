@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Utc};
 use dotenvy::dotenv;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -199,16 +199,19 @@ impl Handler {
         if let Err(err) = self.backfill_recent_bans(ctx, guild_id).await {
             warn!("Failed to backfill recent bans from audit logs: {err}");
         }
-        self.remove_recent_bans_embed(ctx).await?;
         self.ensure_warning_embed(ctx).await?;
 
         Ok(())
     }
 
     async fn ensure_warning_embed(&self, ctx: &Context) -> anyhow::Result<()> {
-        let (existing_message_id, total_bans) = {
+        let (existing_message_id, total_bans, last_ban_at) = {
             let state = self.state.honeypot.lock().await;
-            (state.warning_message_id, state.total_bans)
+            (
+                state.warning_message_id,
+                state.total_bans,
+                state.recent_bans.first().map(|ban| ban.banned_at),
+            )
         };
 
         let message_id = self
@@ -217,7 +220,7 @@ impl Handler {
                 existing_message_id,
                 None,
                 "DO NOT POST HERE",
-                build_warning_embed(total_bans),
+                build_warning_embed(total_bans, last_ban_at),
                 true,
             )
             .await?;
@@ -322,58 +325,6 @@ impl Handler {
         }
 
         self.ensure_warning_embed(ctx).await
-    }
-
-    async fn remove_recent_bans_embed(&self, ctx: &Context) -> anyhow::Result<()> {
-        let bot_id = ctx.cache.current_user().id;
-        let stored_message_id = {
-            let state = self.state.honeypot.lock().await;
-            state.recent_bans_message_id
-        };
-
-        if let Some(message_id) = stored_message_id {
-            match self
-                .config
-                .monitored_channel_id
-                .message(ctx, MessageId::new(message_id))
-                .await
-            {
-                Ok(message) if is_managed_embed(&message, bot_id, "📋 Recent Bans") => {
-                    message.delete(ctx).await?;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Failed to fetch stored recent bans embed {message_id}: {err}");
-                }
-            }
-        }
-
-        if let Some(message_id) = self
-            .find_managed_embed_message(ctx, "📋 Recent Bans")
-            .await?
-        {
-            match self
-                .config
-                .monitored_channel_id
-                .message(ctx, message_id)
-                .await
-            {
-                Ok(message) => {
-                    message.delete(ctx).await?;
-                }
-                Err(err) => {
-                    warn!("Failed to delete discovered recent bans embed {message_id}: {err}");
-                }
-            }
-        }
-
-        let mut state = self.state.honeypot.lock().await;
-        if state.recent_bans_message_id.is_some() {
-            state.recent_bans_message_id = None;
-            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
-        }
-
-        Ok(())
     }
 
     async fn upsert_embed_message(
@@ -1203,16 +1154,38 @@ fn mod_log_attachment_filename(filename: &str) -> String {
     }
 }
 
-fn build_warning_embed(total_bans: u64) -> CreateEmbed {
+fn build_warning_embed(total_bans: u64, last_ban_at: Option<i64>) -> CreateEmbed {
+    let footer = if let Some(last_ban_at) = last_ban_at {
+        format!(
+            "{total_bans} total accounts · Last ban at {}",
+            format_last_ban_time(last_ban_at)
+        )
+    } else {
+        format!("{total_bans} total accounts")
+    };
+
     CreateEmbed::new()
         .title("DO NOT POST HERE")
-        .description(
-            "**This is a bot trap. DO NOT POST. You will be banned**.\n\
-⚠️ This is your only warning.",
-        )
-        .field("Stats", format!("{} accounts banned", total_bans), false)
-        .footer(CreateEmbedFooter::new("The channel is actively monitored."))
+        .description("This is a bot trap. You will be banned.")
+        .footer(CreateEmbedFooter::new(footer))
         .color(Colour::DARK_RED)
+}
+
+fn format_last_ban_time(timestamp: i64) -> String {
+    let Some(utc_time) = DateTime::from_timestamp(timestamp, 0) else {
+        return "unknown".to_string();
+    };
+
+    let local_time = utc_time.with_timezone(&Local);
+    let now = Local::now();
+
+    if local_time.date_naive() == now.date_naive() {
+        local_time.format("Today at %-I:%M %p").to_string()
+    } else if local_time.year() == now.year() {
+        local_time.format("%b %-d at %-I:%M %p").to_string()
+    } else {
+        local_time.format("%b %-d, %Y at %-I:%M %p").to_string()
+    }
 }
 
 fn add_recent_ban(state: &mut HoneypotState, ban: RecentBan) {
