@@ -9,31 +9,27 @@ use std::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dotenvy::dotenv;
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     builder::{
-        CreateCommand,
-        CreateCommandOption,
-        CreateEmbed,
-        CreateInteractionResponse,
-        CreateInteractionResponseMessage,
-        CreateMessage,
+        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
+        CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMessage,
         GetMessages,
     },
     model::{
         application::{
-            Command,
-            CommandDataOption,
-            CommandDataOptionValue,
-            CommandInteraction,
-            CommandOptionType,
-            Interaction,
+            Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
+            CommandOptionType, Interaction,
         },
         channel::{Attachment, ChannelType, GuildChannel, Message},
         colour::Colour,
         gateway::Ready,
-        guild::{Member, PartialGuild},
-        id::{ChannelId, GuildId, RoleId, UserId},
+        guild::{
+            Member, PartialGuild,
+            audit_log::{Action, MemberAction},
+        },
+        id::{ChannelId, GuildId, MessageId, RoleId, UserId},
         permissions::Permissions,
     },
     prelude::*,
@@ -44,6 +40,7 @@ use tokio::{
 };
 
 const DELETE_BATCH_SIZE: usize = 100;
+const RECENT_BAN_LIMIT: usize = 10;
 
 #[derive(Clone)]
 struct Config {
@@ -51,6 +48,7 @@ struct Config {
     monitored_channel_id: ChannelId,
     mod_log_channel_id: Option<ChannelId>,
     whitelist_file: PathBuf,
+    honeypot_state_file: PathBuf,
     channel_concurrency: usize,
     max_retries: usize,
     processing_debounce_seconds: u64,
@@ -59,6 +57,7 @@ struct Config {
 struct SharedState {
     whitelist_role_ids: RwLock<HashMap<GuildId, HashSet<RoleId>>>,
     processing_users: Mutex<HashSet<UserId>>,
+    honeypot: Mutex<HoneypotState>,
     channel_semaphore: Arc<Semaphore>,
 }
 
@@ -67,20 +66,36 @@ struct Handler {
     state: Arc<SharedState>,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct HoneypotState {
+    warning_message_id: Option<u64>,
+    recent_bans_message_id: Option<u64>,
+    recent_bans: Vec<RecentBan>,
+    total_bans: u64,
+    last_audit_log_entry_id: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RecentBan {
+    user_id: u64,
+    username: String,
+    banned_at: i64,
+    audit_log_entry_id: Option<u64>,
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!(
-            "Logged in as {} (ID: {}).",
-            ready.user.name,
-            ready.user.id
-        );
+        info!("Logged in as {} (ID: {}).", ready.user.name, ready.user.id);
         info!("Connected to {} guild(s).", ready.guilds.len());
         info!("Syncing slash commands...");
         if let Err(err) = self.register_commands(&ctx).await {
             warn!("Failed to register slash commands: {err}");
         } else {
             info!("Slash commands synced.");
+        }
+        if let Err(err) = self.initialize_honeypot_channel(&ctx).await {
+            warn!("Failed to initialize honeypot embeds: {err}");
         }
     }
 
@@ -134,13 +149,15 @@ impl EventHandler for Handler {
             author_id
         );
 
-        self.ban_user(&ctx, guild_id, author_id).await;
+        let banned = self.ban_user(&ctx, guild_id, author_id).await;
+        if banned {
+            if let Err(err) = self.record_honeypot_ban(&ctx, &message).await {
+                warn!("Failed to record honeypot ban for {}: {err}", author_id);
+            }
+        }
 
         if let Some(mod_channel) = self.config.mod_log_channel_id {
-            if let Err(err) = self
-                .send_mod_log(&ctx, mod_channel, &message)
-                .await
-            {
+            if let Err(err) = self.send_mod_log(&ctx, mod_channel, &message).await {
                 warn!("Failed to send mod log: {err}");
             }
         }
@@ -172,13 +189,209 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    async fn initialize_honeypot_channel(&self, ctx: &Context) -> anyhow::Result<()> {
+        let channel = match self.config.monitored_channel_id.to_channel(ctx).await? {
+            serenity::model::channel::Channel::Guild(channel) => channel,
+            _ => return Ok(()),
+        };
+        let guild_id = channel.guild_id;
+
+        self.ensure_warning_embed(ctx).await?;
+        if let Err(err) = self.backfill_recent_bans(ctx, guild_id).await {
+            warn!("Failed to backfill recent bans from audit logs: {err}");
+        }
+        self.refresh_recent_bans_embed(ctx).await?;
+
+        Ok(())
+    }
+
+    async fn ensure_warning_embed(&self, ctx: &Context) -> anyhow::Result<()> {
+        let (existing_message_id, protected_message_id) = {
+            let state = self.state.honeypot.lock().await;
+            (state.warning_message_id, state.recent_bans_message_id)
+        };
+
+        let message_id = self
+            .upsert_embed_message(
+                ctx,
+                existing_message_id,
+                protected_message_id,
+                build_warning_embed(),
+            )
+            .await?;
+
+        let mut state = self.state.honeypot.lock().await;
+        if state.warning_message_id != Some(message_id) {
+            state.warning_message_id = Some(message_id);
+            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_recent_bans_embed(&self, ctx: &Context) -> anyhow::Result<()> {
+        let (existing_message_id, protected_message_id, recent_bans, total_bans) = {
+            let state = self.state.honeypot.lock().await;
+            (
+                state.recent_bans_message_id,
+                state.warning_message_id,
+                state.recent_bans.clone(),
+                state.total_bans,
+            )
+        };
+
+        let message_id = self
+            .upsert_embed_message(
+                ctx,
+                existing_message_id,
+                protected_message_id,
+                build_recent_bans_embed(&recent_bans, total_bans),
+            )
+            .await?;
+
+        let mut state = self.state.honeypot.lock().await;
+        if state.recent_bans_message_id != Some(message_id) {
+            state.recent_bans_message_id = Some(message_id);
+            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
+        }
+
+        Ok(())
+    }
+
+    async fn backfill_recent_bans(&self, ctx: &Context, guild_id: GuildId) -> anyhow::Result<()> {
+        let bot_id = ctx.cache.current_user().id;
+        let last_seen_entry_id = {
+            let state = self.state.honeypot.lock().await;
+            state.last_audit_log_entry_id
+        };
+
+        let logs = guild_id
+            .audit_logs(
+                ctx,
+                Some(Action::Member(MemberAction::BanAdd)),
+                Some(bot_id),
+                None,
+                Some(100),
+            )
+            .await?;
+
+        let channel_id_text = self.config.monitored_channel_id.get().to_string();
+        let mut recent_matches = Vec::new();
+        let mut latest_entry_id = last_seen_entry_id;
+        let mut matching_entries_seen = 0_u64;
+
+        for entry in logs.entries {
+            let entry_id = entry.id.get();
+            let Some(reason) = entry.reason.as_deref() else {
+                continue;
+            };
+            if !reason.contains("Posted in monitored channel") || !reason.contains(&channel_id_text)
+            {
+                continue;
+            }
+
+            matching_entries_seen += 1;
+            if last_seen_entry_id.is_some_and(|last_seen| entry_id <= last_seen) {
+                continue;
+            }
+
+            let Some(target_id) = entry.target_id else {
+                continue;
+            };
+
+            latest_entry_id = Some(latest_entry_id.map_or(entry_id, |latest| latest.max(entry_id)));
+            let user_id = target_id.get();
+            let username = logs
+                .users
+                .get(&UserId::new(user_id))
+                .map(|user| user.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            recent_matches.push(RecentBan {
+                user_id,
+                username,
+                banned_at: entry.id.created_at().unix_timestamp(),
+                audit_log_entry_id: Some(entry_id),
+            });
+        }
+
+        let mut state = self.state.honeypot.lock().await;
+        if recent_matches.is_empty()
+            && latest_entry_id == last_seen_entry_id
+            && state.total_bans >= matching_entries_seen
+        {
+            return Ok(());
+        }
+        for ban in recent_matches.into_iter().rev() {
+            add_recent_ban(&mut state, ban);
+        }
+        state.total_bans = state.total_bans.max(matching_entries_seen);
+        state.last_audit_log_entry_id = latest_entry_id;
+        save_honeypot_state(&self.config.honeypot_state_file, &state)?;
+
+        Ok(())
+    }
+
+    async fn record_honeypot_ban(&self, ctx: &Context, message: &Message) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.honeypot.lock().await;
+            state.total_bans = state.total_bans.saturating_add(1);
+            add_recent_ban(
+                &mut state,
+                RecentBan {
+                    user_id: message.author.id.get(),
+                    username: message.author.name.clone(),
+                    banned_at: Utc::now().timestamp(),
+                    audit_log_entry_id: None,
+                },
+            );
+            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
+        }
+
+        self.refresh_recent_bans_embed(ctx).await
+    }
+
+    async fn upsert_embed_message(
+        &self,
+        ctx: &Context,
+        existing_message_id: Option<u64>,
+        protected_message_id: Option<u64>,
+        embed: CreateEmbed,
+    ) -> anyhow::Result<u64> {
+        if let Some(message_id) = existing_message_id.filter(|id| Some(*id) != protected_message_id)
+        {
+            match self
+                .config
+                .monitored_channel_id
+                .edit_message(
+                    ctx,
+                    MessageId::new(message_id),
+                    EditMessage::new().content("").embed(embed.clone()),
+                )
+                .await
+            {
+                Ok(message) => return Ok(message.id.get()),
+                Err(err) => {
+                    warn!(
+                        "Failed to edit managed honeypot message {}; recreating it: {err}",
+                        message_id
+                    );
+                }
+            }
+        }
+
+        let message = self
+            .config
+            .monitored_channel_id
+            .send_message(ctx, CreateMessage::new().embed(embed))
+            .await?;
+        Ok(message.id.get())
+    }
+
     async fn register_commands(&self, ctx: &Context) -> anyhow::Result<()> {
-        let role_id_option = CreateCommandOption::new(
-            CommandOptionType::Role,
-            "role",
-            "Role to add or remove",
-        )
-        .required(true);
+        let role_id_option =
+            CreateCommandOption::new(CommandOptionType::Role, "role", "Role to add or remove")
+                .required(true);
 
         let command = CreateCommand::new("whitelist")
             .description("Manage the role whitelist")
@@ -248,7 +461,8 @@ impl Handler {
         let subcommand = match command.data.options.first() {
             Some(option) => option,
             None => {
-                self.respond_ephemeral(ctx, command, "Missing subcommand.").await?;
+                self.respond_ephemeral(ctx, command, "Missing subcommand.")
+                    .await?;
                 return Ok(());
             }
         };
@@ -335,9 +549,7 @@ impl Handler {
         let response = if let Some(role_name) = role_name {
             format!("Added role `{role_name}` ({role_id}) to whitelist.")
         } else {
-            format!(
-                "Added role ID `{role_id}` to whitelist (role not found on this guild)."
-            )
+            format!("Added role ID `{role_id}` to whitelist (role not found on this guild).")
         };
 
         Ok(response)
@@ -450,10 +662,12 @@ impl Handler {
             _ => return None,
         };
 
-        options.iter().find_map(|opt| match (&*opt.name, &opt.value) {
-            ("role", CommandDataOptionValue::Role(role_id)) => Some(*role_id),
-            _ => None,
-        })
+        options
+            .iter()
+            .find_map(|opt| match (&*opt.name, &opt.value) {
+                ("role", CommandDataOptionValue::Role(role_id)) => Some(*role_id),
+                _ => None,
+            })
     }
 
     async fn has_moderator_permissions(
@@ -503,21 +717,27 @@ impl Handler {
             Some(roles) => roles,
             None => return Ok(false),
         };
-        Ok(member.roles.iter().any(|role_id| guild_roles.contains(role_id)))
+        Ok(member
+            .roles
+            .iter()
+            .any(|role_id| guild_roles.contains(role_id)))
     }
 
-    async fn ban_user(&self, ctx: &Context, guild_id: GuildId, user_id: UserId) {
-        let reason = format!("Posted in monitored channel {}", self.config.monitored_channel_id);
+    async fn ban_user(&self, ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool {
+        let reason = format!(
+            "Posted in monitored channel {}",
+            self.config.monitored_channel_id
+        );
         if let Err(err) = backoff_retry(self.config.max_retries, || async {
-            guild_id
-                .ban_with_reason(ctx, user_id, 0, &reason)
-                .await
+            guild_id.ban_with_reason(ctx, user_id, 0, &reason).await
         })
         .await
         {
             warn!("Failed to ban user {user_id}: {err}");
+            false
         } else {
             info!("Banned user {user_id}");
+            true
         }
     }
 
@@ -533,31 +753,34 @@ impl Handler {
         };
         let bot_id = ctx.cache.current_user().id;
 
-        let (guild, mod_channel, channel_name) = if let Some(cached_guild) =
-            guild_id.to_guild_cached(ctx)
-        {
-            let mod_channel = match cached_guild.channels.get(&mod_channel_id) {
-                Some(channel) => channel.clone(),
-                None => return Ok(()),
+        let (guild, mod_channel, channel_name) =
+            if let Some(cached_guild) = guild_id.to_guild_cached(ctx) {
+                let mod_channel = match cached_guild.channels.get(&mod_channel_id) {
+                    Some(channel) => channel.clone(),
+                    None => return Ok(()),
+                };
+                let channel_name = cached_guild
+                    .channels
+                    .get(&message.channel_id)
+                    .map(|channel| channel.name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                (
+                    PartialGuild::from(cached_guild.clone()),
+                    mod_channel,
+                    channel_name,
+                )
+            } else {
+                let guild = guild_id.to_partial_guild(ctx).await?;
+                let mod_channel = match mod_channel_id.to_channel(ctx).await? {
+                    serenity::model::channel::Channel::Guild(channel) => channel,
+                    _ => return Ok(()),
+                };
+                let channel_name = match message.channel_id.to_channel(ctx).await? {
+                    serenity::model::channel::Channel::Guild(channel) => channel.name.clone(),
+                    _ => "unknown".to_string(),
+                };
+                (guild, mod_channel, channel_name)
             };
-            let channel_name = cached_guild
-                .channels
-                .get(&message.channel_id)
-                .map(|channel| channel.name.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            (PartialGuild::from(cached_guild.clone()), mod_channel, channel_name)
-        } else {
-            let guild = guild_id.to_partial_guild(ctx).await?;
-            let mod_channel = match mod_channel_id.to_channel(ctx).await? {
-                serenity::model::channel::Channel::Guild(channel) => channel,
-                _ => return Ok(()),
-            };
-            let channel_name = match message.channel_id.to_channel(ctx).await? {
-                serenity::model::channel::Channel::Guild(channel) => channel.name.clone(),
-                _ => "unknown".to_string(),
-            };
-            (guild, mod_channel, channel_name)
-        };
 
         let bot_member = match guild_id.member(ctx, bot_id).await {
             Ok(member) => member,
@@ -628,7 +851,10 @@ impl Handler {
         author_id: UserId,
         cutoff: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        info!("Starting cleanup for user {} in guild {}", author_id, guild_id);
+        info!(
+            "Starting cleanup for user {} in guild {}",
+            author_id, guild_id
+        );
 
         let bot_id = ctx.cache.current_user().id;
         let bot_member = match guild_id.member(ctx, bot_id).await {
@@ -639,26 +865,25 @@ impl Handler {
             }
         };
 
-        let (guild, channels): (PartialGuild, Vec<GuildChannel>) = if let Some(cached_guild) =
-            guild_id.to_guild_cached(ctx)
-        {
-            let channels = cached_guild
-                .channels
-                .values()
-                .filter(|channel| channel.kind == ChannelType::Text)
-                .cloned()
-                .collect();
-            (PartialGuild::from(cached_guild.clone()), channels)
-        } else {
-            let guild = guild_id.to_partial_guild(ctx).await?;
-            let channels_map = guild_id.channels(ctx).await?;
-            let channels = channels_map
-                .values()
-                .filter(|channel| channel.kind == ChannelType::Text)
-                .cloned()
-                .collect();
-            (guild, channels)
-        };
+        let (guild, channels): (PartialGuild, Vec<GuildChannel>) =
+            if let Some(cached_guild) = guild_id.to_guild_cached(ctx) {
+                let channels = cached_guild
+                    .channels
+                    .values()
+                    .filter(|channel| channel.kind == ChannelType::Text)
+                    .cloned()
+                    .collect();
+                (PartialGuild::from(cached_guild.clone()), channels)
+            } else {
+                let guild = guild_id.to_partial_guild(ctx).await?;
+                let channels_map = guild_id.channels(ctx).await?;
+                let channels = channels_map
+                    .values()
+                    .filter(|channel| channel.kind == ChannelType::Text)
+                    .cloned()
+                    .collect();
+                (guild, channels)
+            };
 
         let guild = Arc::new(guild);
         let bot_member = Arc::new(bot_member);
@@ -794,8 +1019,10 @@ async fn safe_bulk_delete(
         backoff_retry(max_retries, || async { fresh[0].delete(ctx).await }).await?;
     } else {
         let ids: Vec<_> = fresh.iter().map(|msg| msg.id).collect();
-        backoff_retry(max_retries, || async { channel_id.delete_messages(ctx, ids.clone()).await })
-            .await?;
+        backoff_retry(max_retries, || async {
+            channel_id.delete_messages(ctx, ids.clone()).await
+        })
+        .await?;
     }
 
     Ok(())
@@ -818,13 +1045,71 @@ fn build_attachment_info(attachments: &[Attachment]) -> Option<(Option<String>, 
         }
 
         if let Some(content_type) = &attachment.content_type {
-            lines.push(format!("[{}]({}) ({})", attachment.filename, attachment.url, content_type));
+            lines.push(format!(
+                "[{}]({}) ({})",
+                attachment.filename, attachment.url, content_type
+            ));
         } else {
             lines.push(format!("[{}]({})", attachment.filename, attachment.url));
         }
     }
 
     Some((image_url, lines))
+}
+
+fn build_warning_embed() -> CreateEmbed {
+    CreateEmbed::new()
+        .title("🚨 DO NOT POST HERE 🚨")
+        .description(
+            "If you post something here, you WILL BE BANNED INSTANTLY.\n\n\
+This channel is a honeypot for compromised accounts and spam bots.\n\
+⚠️ This is your only warning.\n\
+Turn back now.\n\
+This message is permanent. The channel is actively monitored.",
+        )
+        .color(Colour::DARK_RED)
+}
+
+fn build_recent_bans_embed(recent_bans: &[RecentBan], total_bans: u64) -> CreateEmbed {
+    let displayed_total = total_bans.max(recent_bans.len() as u64);
+
+    CreateEmbed::new()
+        .title("📋 Recent Bans")
+        .description(build_recent_bans_text(recent_bans))
+        .color(Colour::DARK_RED)
+        .footer(CreateEmbedFooter::new(format!(
+            "Last 10 bans · {displayed_total} total · Updates automatically"
+        )))
+        .timestamp(serenity::model::Timestamp::now())
+}
+
+fn build_recent_bans_text(recent_bans: &[RecentBan]) -> String {
+    if recent_bans.is_empty() {
+        return "No honeypot bans recorded yet.".to_string();
+    }
+
+    recent_bans
+        .iter()
+        .take(RECENT_BAN_LIMIT)
+        .map(|ban| {
+            format!(
+                "<@{}> ({}) — <t:{}:R>",
+                ban.user_id, ban.username, ban.banned_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn add_recent_ban(state: &mut HoneypotState, ban: RecentBan) {
+    state
+        .recent_bans
+        .retain(|existing| existing.user_id != ban.user_id);
+    state.recent_bans.push(ban);
+    state
+        .recent_bans
+        .sort_by(|left, right| right.banned_at.cmp(&left.banned_at));
+    state.recent_bans.truncate(RECENT_BAN_LIMIT);
 }
 
 async fn backoff_retry<F, Fut, T>(retries: usize, mut f: F) -> anyhow::Result<T>
@@ -842,7 +1127,10 @@ where
                 if attempt >= retries {
                     return Err(anyhow::anyhow!(err));
                 }
-                warn!("Transient error attempt {}/{}: {err}; retrying in {:?}", attempt, retries, delay);
+                warn!(
+                    "Transient error attempt {}/{}: {err}; retrying in {:?}",
+                    attempt, retries, delay
+                );
                 sleep(delay).await;
                 delay *= 2;
             }
@@ -855,13 +1143,18 @@ fn whitelist_path(raw_path: &str) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
 fn load_whitelist(path: &PathBuf) -> anyhow::Result<HashMap<GuildId, HashSet<RoleId>>> {
     if !path.exists() {
-        info!("Whitelist file {} not present; starting with empty whitelist.", path.display());
+        info!(
+            "Whitelist file {} not present; starting with empty whitelist.",
+            path.display()
+        );
         return Ok(HashMap::new());
     }
 
@@ -926,6 +1219,29 @@ fn save_whitelist(
     Ok(())
 }
 
+fn load_honeypot_state(path: &PathBuf) -> anyhow::Result<HoneypotState> {
+    if !path.exists() {
+        info!(
+            "Honeypot state file {} not present; starting with empty state.",
+            path.display()
+        );
+        return Ok(HoneypotState::default());
+    }
+
+    let data = std::fs::read_to_string(path)?;
+    let mut state: HoneypotState = serde_json::from_str(&data).unwrap_or_default();
+    state.total_bans = state.total_bans.max(state.recent_bans.len() as u64);
+    Ok(state)
+}
+
+fn save_honeypot_state(path: &PathBuf, state: &HoneypotState) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(state)?;
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 fn build_config() -> anyhow::Result<Config> {
     dotenv().ok();
 
@@ -936,9 +1252,7 @@ fn build_config() -> anyhow::Result<Config> {
 
     let monitored_channel_raw = env::var("MONITORED_CHANNEL_ID")?;
     if monitored_channel_raw.trim().is_empty() {
-        anyhow::bail!(
-            "MONITORED_CHANNEL_ID is empty. Set it in your environment or .env file."
-        );
+        anyhow::bail!("MONITORED_CHANNEL_ID is empty. Set it in your environment or .env file.");
     }
     let monitored_channel_id: u64 = monitored_channel_raw.parse()?;
 
@@ -956,6 +1270,9 @@ fn build_config() -> anyhow::Result<Config> {
 
     let whitelist_file = whitelist_path(
         &env::var("WHITELIST_FILE").unwrap_or_else(|_| "whitelist_ids.json".to_string()),
+    );
+    let honeypot_state_file = whitelist_path(
+        &env::var("HONEYPOT_STATE_FILE").unwrap_or_else(|_| "honeypot_state.json".to_string()),
     );
 
     let channel_concurrency = env::var("CHANNEL_CONCURRENCY")
@@ -978,6 +1295,7 @@ fn build_config() -> anyhow::Result<Config> {
         monitored_channel_id: ChannelId::new(monitored_channel_id),
         mod_log_channel_id,
         whitelist_file,
+        honeypot_state_file,
         channel_concurrency,
         max_retries,
         processing_debounce_seconds,
@@ -991,10 +1309,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(build_config()?);
     let whitelist = load_whitelist(&config.whitelist_file)?;
+    let honeypot = load_honeypot_state(&config.honeypot_state_file)?;
 
     let state = Arc::new(SharedState {
         whitelist_role_ids: RwLock::new(whitelist),
         processing_users: Mutex::new(HashSet::new()),
+        honeypot: Mutex::new(honeypot),
         channel_semaphore: Arc::new(Semaphore::new(config.channel_concurrency)),
     });
 
