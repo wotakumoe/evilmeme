@@ -216,7 +216,9 @@ impl Handler {
                 ctx,
                 existing_message_id,
                 protected_message_id,
+                "🚨 DO NOT POST HERE 🚨",
                 build_warning_embed(),
+                false,
             )
             .await?;
 
@@ -245,7 +247,9 @@ impl Handler {
                 ctx,
                 existing_message_id,
                 protected_message_id,
+                "📋 Recent Bans",
                 build_recent_bans_embed(&recent_bans, total_bans),
+                true,
             )
             .await?;
 
@@ -356,28 +360,67 @@ impl Handler {
         ctx: &Context,
         existing_message_id: Option<u64>,
         protected_message_id: Option<u64>,
+        expected_title: &str,
         embed: CreateEmbed,
+        edit_existing: bool,
     ) -> anyhow::Result<u64> {
+        let bot_id = ctx.cache.current_user().id;
+
         if let Some(message_id) = existing_message_id.filter(|id| Some(*id) != protected_message_id)
         {
-            match self
+            let existing = self
                 .config
                 .monitored_channel_id
-                .edit_message(
-                    ctx,
-                    MessageId::new(message_id),
-                    EditMessage::new().content("").embed(embed.clone()),
-                )
-                .await
-            {
-                Ok(message) => return Ok(message.id.get()),
+                .message(ctx, MessageId::new(message_id))
+                .await;
+
+            match existing {
+                Ok(message) if is_managed_embed(&message, bot_id, expected_title) => {
+                    if !edit_existing {
+                        return Ok(message.id.get());
+                    }
+
+                    let message = self
+                        .config
+                        .monitored_channel_id
+                        .edit_message(
+                            ctx,
+                            MessageId::new(message_id),
+                            EditMessage::new().content("").embed(embed.clone()),
+                        )
+                        .await?;
+                    return Ok(message.id.get());
+                }
+                Ok(message) => {
+                    warn!(
+                        "Stored honeypot message {} is not the expected '{}' embed; searching channel before creating a new one.",
+                        message.id, expected_title
+                    );
+                }
                 Err(err) => {
                     warn!(
-                        "Failed to edit managed honeypot message {}; recreating it: {err}",
+                        "Failed to fetch managed honeypot message {}; searching channel before creating a new one: {err}",
                         message_id
                     );
                 }
             }
+        }
+
+        if let Some(message_id) = self.find_managed_embed_message(ctx, expected_title).await? {
+            if !edit_existing {
+                return Ok(message_id.get());
+            }
+
+            let message = self
+                .config
+                .monitored_channel_id
+                .edit_message(
+                    ctx,
+                    message_id,
+                    EditMessage::new().content("").embed(embed.clone()),
+                )
+                .await?;
+            return Ok(message.id.get());
         }
 
         let message = self
@@ -386,6 +429,23 @@ impl Handler {
             .send_message(ctx, CreateMessage::new().embed(embed))
             .await?;
         Ok(message.id.get())
+    }
+
+    async fn find_managed_embed_message(
+        &self,
+        ctx: &Context,
+        expected_title: &str,
+    ) -> anyhow::Result<Option<MessageId>> {
+        let messages = self
+            .config
+            .monitored_channel_id
+            .messages(ctx, GetMessages::new().limit(50))
+            .await?;
+
+        Ok(messages
+            .iter()
+            .find(|message| is_managed_embed(message, ctx.cache.current_user().id, expected_title))
+            .map(|message| message.id))
     }
 
     async fn register_commands(&self, ctx: &Context) -> anyhow::Result<()> {
@@ -1111,6 +1171,15 @@ fn add_recent_ban(state: &mut HoneypotState, ban: RecentBan) {
         .recent_bans
         .sort_by(|left, right| right.banned_at.cmp(&left.banned_at));
     state.recent_bans.truncate(RECENT_BAN_LIMIT);
+}
+
+fn is_managed_embed(message: &Message, bot_id: UserId, expected_title: &str) -> bool {
+    message.author.id == bot_id
+        && message
+            .embeds
+            .first()
+            .and_then(|embed| embed.title.as_deref())
+            == Some(expected_title)
 }
 
 async fn backoff_retry<F, Fut, T>(retries: usize, mut f: F) -> anyhow::Result<T>
