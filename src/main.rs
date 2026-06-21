@@ -196,66 +196,35 @@ impl Handler {
         };
         let guild_id = channel.guild_id;
 
-        self.ensure_warning_embed(ctx).await?;
         if let Err(err) = self.backfill_recent_bans(ctx, guild_id).await {
             warn!("Failed to backfill recent bans from audit logs: {err}");
         }
-        self.refresh_recent_bans_embed(ctx).await?;
+        self.remove_recent_bans_embed(ctx).await?;
+        self.ensure_warning_embed(ctx).await?;
 
         Ok(())
     }
 
     async fn ensure_warning_embed(&self, ctx: &Context) -> anyhow::Result<()> {
-        let (existing_message_id, protected_message_id) = {
+        let (existing_message_id, total_bans) = {
             let state = self.state.honeypot.lock().await;
-            (state.warning_message_id, state.recent_bans_message_id)
+            (state.warning_message_id, state.total_bans)
         };
 
         let message_id = self
             .upsert_embed_message(
                 ctx,
                 existing_message_id,
-                protected_message_id,
-                "🚨 DO NOT POST HERE 🚨",
-                build_warning_embed(),
-                false,
+                None,
+                "DO NOT POST HERE",
+                build_warning_embed(total_bans),
+                true,
             )
             .await?;
 
         let mut state = self.state.honeypot.lock().await;
         if state.warning_message_id != Some(message_id) {
             state.warning_message_id = Some(message_id);
-            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
-        }
-
-        Ok(())
-    }
-
-    async fn refresh_recent_bans_embed(&self, ctx: &Context) -> anyhow::Result<()> {
-        let (existing_message_id, protected_message_id, recent_bans, total_bans) = {
-            let state = self.state.honeypot.lock().await;
-            (
-                state.recent_bans_message_id,
-                state.warning_message_id,
-                state.recent_bans.clone(),
-                state.total_bans,
-            )
-        };
-
-        let message_id = self
-            .upsert_embed_message(
-                ctx,
-                existing_message_id,
-                protected_message_id,
-                "📋 Recent Bans",
-                build_recent_bans_embed(&recent_bans, total_bans),
-                true,
-            )
-            .await?;
-
-        let mut state = self.state.honeypot.lock().await;
-        if state.recent_bans_message_id != Some(message_id) {
-            state.recent_bans_message_id = Some(message_id);
             save_honeypot_state(&self.config.honeypot_state_file, &state)?;
         }
 
@@ -352,7 +321,59 @@ impl Handler {
             save_honeypot_state(&self.config.honeypot_state_file, &state)?;
         }
 
-        self.refresh_recent_bans_embed(ctx).await
+        self.ensure_warning_embed(ctx).await
+    }
+
+    async fn remove_recent_bans_embed(&self, ctx: &Context) -> anyhow::Result<()> {
+        let bot_id = ctx.cache.current_user().id;
+        let stored_message_id = {
+            let state = self.state.honeypot.lock().await;
+            state.recent_bans_message_id
+        };
+
+        if let Some(message_id) = stored_message_id {
+            match self
+                .config
+                .monitored_channel_id
+                .message(ctx, MessageId::new(message_id))
+                .await
+            {
+                Ok(message) if is_managed_embed(&message, bot_id, "📋 Recent Bans") => {
+                    message.delete(ctx).await?;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("Failed to fetch stored recent bans embed {message_id}: {err}");
+                }
+            }
+        }
+
+        if let Some(message_id) = self
+            .find_managed_embed_message(ctx, "📋 Recent Bans")
+            .await?
+        {
+            match self
+                .config
+                .monitored_channel_id
+                .message(ctx, message_id)
+                .await
+            {
+                Ok(message) => {
+                    message.delete(ctx).await?;
+                }
+                Err(err) => {
+                    warn!("Failed to delete discovered recent bans embed {message_id}: {err}");
+                }
+            }
+        }
+
+        let mut state = self.state.honeypot.lock().await;
+        if state.recent_bans_message_id.is_some() {
+            state.recent_bans_message_id = None;
+            save_honeypot_state(&self.config.honeypot_state_file, &state)?;
+        }
+
+        Ok(())
     }
 
     async fn upsert_embed_message(
@@ -1182,49 +1203,16 @@ fn mod_log_attachment_filename(filename: &str) -> String {
     }
 }
 
-fn build_warning_embed() -> CreateEmbed {
+fn build_warning_embed(total_bans: u64) -> CreateEmbed {
     CreateEmbed::new()
-        .title("🚨 DO NOT POST HERE 🚨")
+        .title("DO NOT POST HERE")
         .description(
-            "If you post something here, you **WILL BE BANNED INSTANTLY**.\n\n\
-This channel is a honeypot for compromised accounts and spam bots.\n\
+            "**This is a bot trap. DO NOT POST. You will be banned**.\n\
 ⚠️ This is your only warning.",
         )
-        .footer(CreateEmbedFooter::new(
-            "This message is permanent. The channel is actively monitored.",
-        ))
+        .field("Stats", format!("{} accounts banned", total_bans), false)
+        .footer(CreateEmbedFooter::new("The channel is actively monitored."))
         .color(Colour::DARK_RED)
-}
-
-fn build_recent_bans_embed(recent_bans: &[RecentBan], total_bans: u64) -> CreateEmbed {
-    let displayed_total = total_bans.max(recent_bans.len() as u64);
-
-    CreateEmbed::new()
-        .title("📋 Recent Bans")
-        .description(build_recent_bans_text(recent_bans))
-        .color(Colour::DARK_RED)
-        .footer(CreateEmbedFooter::new(format!(
-            "Last 10 bans · {displayed_total} total · Updates automatically"
-        )))
-        .timestamp(serenity::model::Timestamp::now())
-}
-
-fn build_recent_bans_text(recent_bans: &[RecentBan]) -> String {
-    if recent_bans.is_empty() {
-        return "No honeypot bans recorded yet.".to_string();
-    }
-
-    recent_bans
-        .iter()
-        .take(RECENT_BAN_LIMIT)
-        .map(|ban| {
-            format!(
-                "<@{}> ({}) — <t:{}:R>",
-                ban.user_id, ban.username, ban.banned_at
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn add_recent_ban(state: &mut HoneypotState, ban: RecentBan) {
